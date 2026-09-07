@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""codex-usage — show Codex rate-limit usage for every logged-in account at once.
+
+Each account lives in its own CODEX_HOME directory. Usage is read via the
+`codex app-server` JSON-RPC methods `account/read` and `account/rateLimits/read`
+(the same source the TUI's /usage command uses), so no tokens are ever handled
+here and refresh happens inside Codex itself.
+"""
+
+import argparse
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ACCOUNTS_DIR = Path(os.environ.get("CODEX_ACCOUNTS_DIR", Path.home() / ".codex-accounts"))
+DEFAULT_HOME = Path(os.environ.get("CODEX_DEFAULT_HOME", Path.home() / ".codex"))
+TIMEOUT = float(os.environ.get("CODEX_USAGE_TIMEOUT", "25"))
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else str(text)
+
+
+def bold(t):
+    return c(t, "1")
+
+
+def dim(t):
+    return c(t, "2")
+
+
+def pct_color(text, pct):
+    if not USE_COLOR:
+        return str(text)
+    if pct >= 90:
+        return c(text, "1;31")
+    if pct >= 75:
+        return c(text, "31")
+    if pct >= 50:
+        return c(text, "33")
+    return c(text, "32")
+
+
+# ---------------------------------------------------------------- discovery
+
+
+def discover_accounts(only=None):
+    """Return [(label, codex_home)] for every configured account."""
+    found = []
+    if (DEFAULT_HOME / "auth.json").exists():
+        found.append(("default", DEFAULT_HOME))
+    if ACCOUNTS_DIR.is_dir():
+        for d in sorted(ACCOUNTS_DIR.iterdir()):
+            if d.is_dir() and d.name != "default":
+                found.append((d.name, d))
+    if only:
+        wanted = set(only)
+        found = [f for f in found if f[0] in wanted]
+        missing = wanted - {f[0] for f in found}
+        for m in sorted(missing):
+            print(f"error: no account named {m!r}", file=sys.stderr)
+        if missing:
+            sys.exit(1)
+    return found
+
+
+# ---------------------------------------------------------------- app-server
+
+
+def query(codex_home):
+    """Drive `codex app-server` over stdio; return (account, rate_limits, error)."""
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(codex_home)
+    env.pop("OPENAI_API_KEY", None)
+
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        return None, None, "codex binary not found on PATH"
+
+    results, errors = {}, {}
+    q = queue.Queue()
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    def send(obj):
+        try:
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+
+    send({"id": 1, "method": "initialize",
+          "params": {"clientInfo": {"name": "codex-usage", "version": "1.0.0"}}})
+    send({"method": "initialized"})
+    send({"id": 2, "method": "account/read", "params": {"refreshToken": True}})
+    send({"id": 3, "method": "account/rateLimits/read"})
+
+    deadline = time.time() + TIMEOUT
+    try:
+        while time.time() < deadline and not ({2, 3} <= (results.keys() | errors.keys())):
+            try:
+                line = q.get(timeout=max(0.05, deadline - time.time()))
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            mid = msg.get("id")
+            if mid in (2, 3):
+                if "result" in msg:
+                    results[mid] = msg["result"]
+                elif "error" in msg:
+                    errors[mid] = msg["error"].get("message", "unknown error")
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    if 3 in errors and 3 not in results:
+        return results.get(2), None, errors[3]
+    if not results:
+        return None, None, "no response from codex app-server (timeout)"
+    return results.get(2), results.get(3), None
+
+
+# ---------------------------------------------------------------- formatting
+
+
+def fmt_window(mins):
+    if not mins:
+        return "?"
+    if mins % 10080 == 0:
+        n = mins // 10080
+        return "weekly" if n == 1 else f"{n}w"
+    if mins % 1440 == 0:
+        return f"{mins // 1440}d"
+    if mins % 60 == 0:
+        return f"{mins // 60}h"
+    return f"{mins}m"
+
+
+def fmt_until(ts):
+    if not ts:
+        return ""
+    d = int(ts - time.time())
+    if d <= 0:
+        return "now"
+    days, rem = divmod(d, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def bar(pct, width=12):
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "█" * filled + dim("·" * (width - filled))
+
+
+def windows_of(snapshot):
+    out = []
+    for key in ("primary", "secondary"):
+        w = snapshot.get(key)
+        if w:
+            out.append(w)
+    out.sort(key=lambda w: w.get("windowDurationMins") or 0)
+    return out
+
+
+def buckets_of(rl):
+    by_id = rl.get("rateLimitsByLimitId")
+    if by_id:
+        return sorted(by_id.items(), key=lambda kv: kv[0])
+    return [(rl.get("limitId") or "codex", rl.get("rateLimits", rl))]
+
+
+def render(rows, verbose):
+    label_w = max((len(r["label"]) for r in rows), default=7)
+
+    for row in rows:
+        label = bold(row["label"].ljust(label_w))
+
+        if row["error"]:
+            print(f"{label}  {c('✗ ' + row['error'], '31')}")
+            continue
+
+        acct = row["account"] or {}
+        email = acct.get("email") or dim("(no email)")
+        plan = acct.get("planType") or "?"
+        head = f"{label}  {email}  {c(plan, '36')}"
+
+        rl = row["rate_limits"] or {}
+        extras = []
+        credits = (rl.get("rateLimits") or {}).get("credits") or {}
+        if credits.get("unlimited"):
+            extras.append("credits: unlimited")
+        elif credits.get("balance") not in (None, "0"):
+            extras.append(f"credits: {credits['balance']}")
+        resets = rl.get("rateLimitResetCredits") or {}
+        if resets.get("availableCount"):
+            extras.append(f"{resets['availableCount']} reset credit(s)")
+        if extras:
+            head += "  " + dim("· " + " · ".join(extras))
+        print(head)
+
+        printed = False
+        buckets = buckets_of(rl)
+        if not verbose and any(k == "codex" for k, _ in buckets):
+            # Compact mode: just the main metered bucket.
+            buckets = [(k, v) for k, v in buckets if k == "codex"]
+        for limit_id, snap in buckets:
+            if not snap:
+                continue
+            wins = windows_of(snap)
+            if not wins:
+                continue
+            name = snap.get("limitName") or limit_id
+            for i, w in enumerate(wins):
+                pct = w.get("usedPercent", 0)
+                tag = (name if i == 0 else "").ljust(22)[:22]
+                line = (
+                    f"  {dim(tag)} {fmt_window(w.get('windowDurationMins')):>7}  "
+                    f"{bar(pct)} {pct_color(f'{pct:3d}%', pct)}"
+                )
+                until = fmt_until(w.get("resetsAt"))
+                if until:
+                    line += dim(f"   resets in {until}")
+                print(line)
+                printed = True
+        if not printed:
+            print(dim("  no rate-limit windows reported"))
+        print()
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_show(args):
+    accounts = discover_accounts(args.account)
+    if not accounts:
+        print("No Codex accounts found.\n")
+        print(f"  Default home : {DEFAULT_HOME}")
+        print(f"  Accounts dir : {ACCOUNTS_DIR}\n")
+        print("Add one with:  codex-usage add <name>")
+        return 1
+
+    with ThreadPoolExecutor(max_workers=min(8, len(accounts))) as pool:
+        futures = {label: pool.submit(query, home) for label, home in accounts}
+        rows = []
+        for label, home in accounts:
+            acct, rl, err = futures[label].result()
+            rows.append({"label": label, "home": str(home),
+                         "account": acct.get("account") if acct else None,
+                         "rate_limits": rl, "error": err})
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    print()
+    render(rows, args.verbose)
+    return 1 if any(r["error"] for r in rows) else 0
+
+
+def cmd_add(args):
+    home = DEFAULT_HOME if args.name == "default" else ACCOUNTS_DIR / args.name
+    home.mkdir(parents=True, exist_ok=True)
+    print(f"Logging in to Codex with CODEX_HOME={home}\n")
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(home)
+    env.pop("OPENAI_API_KEY", None)
+    return subprocess.call(["codex", "login"], env=env)
+
+
+def cmd_list(args):
+    accounts = discover_accounts()
+    if not accounts:
+        print("no accounts configured")
+        return 1
+    for label, home in accounts:
+        print(f"{label:<16} {home}")
+    return 0
+
+
+def cmd_run(args):
+    accounts = dict(discover_accounts())
+    if args.name not in accounts:
+        print(f"error: no account named {args.name!r}", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(accounts[args.name])
+    env.pop("OPENAI_API_KEY", None)
+    return subprocess.call(["codex"] + args.rest, env=env)
+
+
+def cmd_remove(args):
+    home = ACCOUNTS_DIR / args.name
+    if args.name == "default" or not home.is_dir():
+        print(f"error: refusing to remove {args.name!r} "
+              f"(only accounts under {ACCOUNTS_DIR} can be removed)", file=sys.stderr)
+        return 1
+    reply = input(f"Permanently delete {home}? [y/N] ").strip().lower()
+    if reply != "y":
+        print("aborted")
+        return 1
+    shutil.rmtree(home)
+    print(f"removed {home}")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="codex-usage",
+        description="Show Codex rate-limit usage across all your accounts in one command.")
+    sub = p.add_subparsers(dest="cmd")
+
+    p.add_argument("-v", "--verbose", action="store_true", help="show every limit bucket")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("-a", "--account", action="append", help="only this account (repeatable)")
+
+    a = sub.add_parser("add", help="log in a new account under its own CODEX_HOME")
+    a.add_argument("name")
+
+    sub.add_parser("list", help="list configured accounts")
+
+    r = sub.add_parser("run", help="run codex using a specific account")
+    r.add_argument("name")
+    r.add_argument("rest", nargs=argparse.REMAINDER)
+
+    rm = sub.add_parser("remove", help="delete an account's CODEX_HOME")
+    rm.add_argument("name")
+
+    args = p.parse_args()
+    if args.cmd == "add":
+        return cmd_add(args)
+    if args.cmd == "list":
+        return cmd_list(args)
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "remove":
+        return cmd_remove(args)
+    return cmd_show(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
